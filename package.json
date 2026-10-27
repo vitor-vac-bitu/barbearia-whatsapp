@@ -1,0 +1,19 @@
+{
+  "name": "bot-atendente-whatsapp",
+  "version": "1.0.0",
+  "description": "Atendente de WhatsApp com IA para pequenos negócios (demo de barbearia)",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.60.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0"
+  }
+}

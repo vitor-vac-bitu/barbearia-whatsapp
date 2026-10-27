@@ -1,0 +1,30 @@
+{
+  "nome": "Barbearia Navalha de Ouro",
+  "tipo": "barbearia",
+  "endereco": "Rua Augusta, 1500 - Consolação, São Paulo",
+  "instagram": "@navalhadeouro",
+  "pagamento": "Pix, cartão de crédito e débito",
+  "profissionais": ["Rafa", "Diego"],
+  "servicos": [
+    { "nome": "Corte", "preco": 50, "duracao_min": 30 },
+    { "nome": "Barba", "preco": 40, "duracao_min": 30 },
+    { "nome": "Corte + Barba", "preco": 80, "duracao_min": 60 },
+    { "nome": "Pezinho", "preco": 20, "duracao_min": 15 },
+    { "nome": "Sobrancelha", "preco": 15, "duracao_min": 15 }
+  ],
+  "horarios": {
+    "dom": null,
+    "seg": null,
+    "ter": ["09:00", "20:00"],
+    "qua": ["09:00", "20:00"],
+    "qui": ["09:00", "20:00"],
+    "sex": ["09:00", "20:00"],
+    "sab": ["08:00", "17:00"]
+  },
+  "intervalo_agenda_min": 30,
+  "regras_extras": [
+    "Tolerância de 10 minutos de atraso; depois disso o horário pode ser remarcado.",
+    "Cancelamentos com pelo menos 2 horas de antecedência.",
+    "Tem estacionamento conveniado na rua de trás."
+  ]
+}
