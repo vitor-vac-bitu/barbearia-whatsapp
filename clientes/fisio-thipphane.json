@@ -1,0 +1,33 @@
+{
+  "instancia": "fisio-thipphane",
+  "dono_whatsapp": "5511955506701",
+  "pausa_humano_horas": 12,
+
+  "nome": "Fisioterapia Thipphane",
+  "tipo": "Fisioterapia",
+  "endereco": "Rua Michigan, 470 - Brooklin, São Paulo",
+  "instagram": "@fisio.thipphane",
+  "pagamento": "Pix",
+  "profissionais": ["Thipphane"],
+  "servicos": [
+    { "nome": "Drenagem", "preco": 200, "duracao_min": 60 },
+    { "nome": "Pilates", "preco": 200, "duracao_min": 60 },
+    { "nome": "Fisioterapia Pélvica", "preco": 300, "duracao_min": 90 }
+  ],
+  "horarios": {
+    "dom": null,
+    "seg": ["08:00", "12:00"],
+    "ter": ["08:00", "12:00"],
+    "qua": ["08:00", "12:00"],
+    "qui": ["08:00", "12:00"],
+    "sex": ["08:00", "12:00"],
+    "sab": null
+  },
+  "intervalo_agenda_min": 30,
+  "antecedencia_min_minutos": 30,
+  "regras_extras": [
+    "Tolerância de 10 minutos de atraso; depois disso o horário pode ser remarcado.",
+    "Cancelamentos com pelo menos 2 horas de antecedência."
+  ],
+  "instrucoes_extras": ""
+}
