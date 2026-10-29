@@ -1,233 +1,174 @@
 import 'dotenv/config';
-import fs from 'node:fs';
+import path from 'node:path';
 import express from 'express';
-import Anthropic from '@anthropic-ai/sdk';
-import { Agenda, agoraSP, nomeDoDia } from './agenda.js';
+import { migrar } from './db.js';
+import { sincronizarArquivos, obterCliente, listarClientes } from './clientes.js';
+import { enviarTexto, foiOBot } from './evolution.js';
+import { responder, salvarMensagem } from './atendente.js';
+import { pausar, estaPausado } from './pausas.js';
+import { comandoDoDono, textoDoAviso } from './dono.js';
+import * as agenda from './agenda.js';
+import { contatoDe, extrairTexto, mesmoNumero, soDigitos } from './util.js';
 
-const negocio = JSON.parse(fs.readFileSync(new URL('./negocio.json', import.meta.url), 'utf8'));
-const agenda = new Agenda(negocio);
-const claude = new Anthropic(); // lê ANTHROPIC_API_KEY do ambiente
-const MODELO = process.env.CLAUDE_MODEL || 'claude-haiku-5-5';
-const { EVOLUTION_URL, EVOLUTION_APIKEY, EVOLUTION_INSTANCE } = process.env;
+const AGRUPAR_MS = Number(process.env.AGRUPAR_MS ?? 2500); // junta mensagens seguidas do cliente
 
-// ---------- Prompt do atendente (montado a partir do negocio.json) ----------
-function promptDoSistema() {
-  const agora = agoraSP();
-  const servicos = negocio.servicos
-    .map((s) => `- ${s.nome}: R$ ${s.preco} (${s.duracao_min} min)`).join('\n');
-  const horarios = Object.entries(negocio.horarios)
-    .map(([d, h]) => `- ${d}: ${h ? `${h[0]} às ${h[1]}` : 'fechado'}`).join('\n');
-  const regras = (negocio.regras_extras || []).map((r) => `- ${r}`).join('\n');
-
-  return `Você é o atendente virtual da ${negocio.nome} (${negocio.tipo}) no WhatsApp.
-Hoje é ${nomeDoDia(agora.data)}, ${agora.data}, e agora são ${agora.hora} (horário de Brasília).
-
-DADOS DO NEGÓCIO
-Endereço: ${negocio.endereco}
-Instagram: ${negocio.instagram}
-Pagamento: ${negocio.pagamento}
-Profissionais: ${(negocio.profissionais || []).join(', ')}
-
-Serviços:
-${servicos}
-
-Horário de funcionamento:
-${horarios}
-
-Regras:
-${regras}
-
-COMO ATENDER
-- Escreva como uma pessoa simpática da recepção: frases curtas, tom leve, no máximo 1 emoji por mensagem.
-- Mensagens de WhatsApp: curtas, sem markdown, sem títulos. Use quebras de linha em vez de listas longas.
-- Para agendar, você precisa de: serviço, dia, horário e nome do cliente. Pergunte o que faltar, uma coisa por vez.
-- SEMPRE use a ferramenta verificar_horarios antes de oferecer horários. Ofereça no máximo 3 a 4 opções.
-- Converta "amanhã", "sábado que vem" etc. em data AAAA-MM-DD com base na data de hoje.
-- Antes de chamar agendar, confirme o resumo com o cliente (serviço, dia, hora, valor). Agende só depois do "sim".
-- Depois de agendar, mande o resumo com o código do agendamento.
-- Nunca invente preços, serviços ou horários que não estejam acima ou nas ferramentas.
-- Se pedirem algo fora do seu alcance (reclamação, assunto pessoal, negociação de preço), diga que vai passar para a equipe.`;
+// ---------- Avisos para o dono ----------
+async function avisarDono(cliente, ev) {
+  if (!cliente.dono_whatsapp) return;
+  const texto = textoDoAviso(cliente, ev);
+  if (texto) await enviarTexto(cliente, soDigitos(cliente.dono_whatsapp), texto);
 }
 
-// ---------- Ferramentas que a IA pode usar ----------
-const ferramentas = [
-  {
-    name: 'verificar_horarios',
-    description: 'Lista horários livres para um serviço numa data.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        data: { type: 'string', description: 'Data no formato AAAA-MM-DD' },
-        servico: { type: 'string', description: 'Nome do serviço' },
-      },
-      required: ['data', 'servico'],
-    },
-  },
-  {
-    name: 'agendar',
-    description: 'Cria o agendamento. Use só depois do cliente confirmar o resumo.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        nome: { type: 'string', description: 'Nome do cliente' },
-        servico: { type: 'string' },
-        data: { type: 'string', description: 'AAAA-MM-DD' },
-        hora: { type: 'string', description: 'HH:MM' },
-      },
-      required: ['nome', 'servico', 'data', 'hora'],
-    },
-  },
-  {
-    name: 'meus_agendamentos',
-    description: 'Lista os próximos agendamentos deste cliente.',
-    input_schema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'cancelar',
-    description: 'Cancela um agendamento deste cliente pelo código.',
-    input_schema: {
-      type: 'object',
-      properties: { id: { type: 'string', description: 'Código do agendamento' } },
-      required: ['id'],
-    },
-  },
-];
-
-function executarFerramenta(nome, entrada, telefone) {
-  switch (nome) {
-    case 'verificar_horarios': return agenda.horariosLivres(entrada.data, entrada.servico);
-    case 'agendar': return agenda.agendar({ ...entrada, telefone });
-    case 'meus_agendamentos': return { agendamentos: agenda.doCliente(telefone) };
-    case 'cancelar': return agenda.cancelar(telefone, (entrada.id || '').toUpperCase());
-    default: return { erro: 'Ferramenta desconhecida' };
-  }
-}
-
-// ---------- Conversa ----------
-const historicos = new Map(); // telefone -> [{role, content}] só com texto
-const MAX_MSGS = 20;
-
-async function responder(telefone, texto) {
-  const historico = historicos.get(telefone) || [];
-  historico.push({ role: 'user', content: texto });
-
-  const mensagens = [...historico];
-  let resposta = '';
-
-  for (let volta = 0; volta < 6; volta++) {
-    const r = await claude.messages.create({
-      model: MODELO,
-      max_tokens: 600,
-      system: promptDoSistema(),
-      tools: ferramentas,
-      messages: mensagens,
-    });
-
-    mensagens.push({ role: 'assistant', content: r.content });
-    const usos = r.content.filter((b) => b.type === 'tool_use');
-
-    if (r.stop_reason !== 'tool_use' || usos.length === 0) {
-      resposta = r.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
-      break;
-    }
-
-    mensagens.push({
-      role: 'user',
-      content: usos.map((u) => ({
-        type: 'tool_result',
-        tool_use_id: u.id,
-        content: JSON.stringify(executarFerramenta(u.name, u.input, telefone)),
-      })),
-    });
-  }
-
-  if (!resposta) resposta = 'Desculpa, me enrolei aqui 😅 Pode repetir, por favor?';
-
-  historico.push({ role: 'assistant', content: resposta });
-  while (historico.length > MAX_MSGS) historico.splice(0, 2); // remove pares antigos
-  historicos.set(telefone, historico);
-  return resposta;
-}
-
-// Uma fila por cliente, para mensagens seguidas não se atropelarem
+// ---------- Fila por conversa (uma resposta de cada vez) ----------
 const filas = new Map();
-function enfileirar(telefone, tarefa) {
-  const anterior = filas.get(telefone) || Promise.resolve();
-  const proxima = anterior.then(tarefa).catch((e) => console.error('Erro:', e.message));
-  filas.set(telefone, proxima);
+function enfileirar(chave, tarefa) {
+  const anterior = filas.get(chave) || Promise.resolve();
+  const proxima = anterior.then(tarefa).catch((e) => console.error(`[${chave}]`, e));
+  filas.set(chave, proxima);
+  proxima.finally(() => { if (filas.get(chave) === proxima) filas.delete(chave); });
   return proxima;
 }
 
-// ---------- Evolution API ----------
-async function enviarWhatsApp(numero, texto) {
-  const r = await fetch(`${EVOLUTION_URL}/message/sendText/${EVOLUTION_INSTANCE}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', apikey: EVOLUTION_APIKEY },
-    body: JSON.stringify({ number: numero, text: texto, delay: 1200 }),
-  });
-  if (!r.ok) console.error('Falha ao enviar:', r.status, await r.text());
+// ---------- Atendimento ----------
+async function atender(cliente, contato, texto, nomeContato) {
+  if (await estaPausado(cliente.instancia, contato)) {
+    await salvarMensagem(cliente.instancia, contato, 'user', texto);
+    return;
+  }
+  let r;
+  try {
+    r = await responder(cliente, contato, texto, nomeContato);
+  } catch (e) {
+    console.error(`[${cliente.instancia}] erro da IA:`, e.message);
+    await enviarTexto(cliente, contato, 'Opa, tive um probleminha aqui 😅 Já já alguém da equipe te responde.');
+    await pausar(cliente.instancia, contato, 1, 'erro do bot');
+    await avisarDono(cliente, { tipo: 'erro', contato });
+    return;
+  }
+  await enviarTexto(cliente, contato, r.resposta);
+  for (const ev of r.eventos) await avisarDono(cliente, ev);
 }
 
-function extrairTexto(msg = {}) {
-  return msg.conversation
-    || msg.extendedTextMessage?.text
-    || msg.imageMessage?.caption
-    || msg.videoMessage?.caption
-    || null;
+const buffers = new Map();
+function agrupar(cliente, contato, texto, nomeContato) {
+  const chave = `${cliente.instancia}|${contato}`;
+  const b = buffers.get(chave) || { textos: [] };
+  b.textos.push(texto);
+  clearTimeout(b.timer);
+  b.timer = setTimeout(() => {
+    buffers.delete(chave);
+    enfileirar(chave, () => atender(cliente, contato, b.textos.join('\n'), nomeContato));
+  }, AGRUPAR_MS);
+  buffers.set(chave, b);
 }
 
 const vistos = new Set();
-const app = express();
-app.use(express.json({ limit: '5mb' }));
 
-app.get('/', (_req, res) => res.send(`Bot ${negocio.nome} no ar ✅`));
+async function tratarMensagem(cliente, d) {
+  const key = d?.key;
+  const jid = key?.remoteJid;
+  if (!jid || jid.endsWith('@g.us') || jid.endsWith('@newsletter') || jid === 'status@broadcast') return;
 
-// Webhook da Evolution (configure com o evento MESSAGES_UPSERT)
-app.post('/webhook', (req, res) => {
-  res.sendStatus(200); // responde rápido; o processamento segue em segundo plano
+  const idUnico = `${cliente.instancia}|${key.id}`;
+  if (vistos.has(idUnico)) return;
+  vistos.add(idUnico);
+  if (vistos.size > 20000) vistos.clear();
 
-  const { event, data } = req.body || {};
-  if (event && !String(event).toLowerCase().includes('messages.upsert') && event !== 'MESSAGES_UPSERT') return;
-  const itens = Array.isArray(data) ? data : [data];
+  const contato = contatoDe(key);
+  const texto = extrairTexto(d.message);
 
-  for (const d of itens) {
-    const jid = d?.key?.remoteJid;
-    if (!jid || d.key.fromMe || jid.endsWith('@g.us') || jid === 'status@broadcast') continue;
-    if (vistos.has(d.key.id)) continue;
-    vistos.add(d.key.id);
-    if (vistos.size > 5000) vistos.clear();
-
-    const numero = jid.split('@')[0];
-    const texto = extrairTexto(d.message);
-
-    enfileirar(numero, async () => {
-      if (!texto) {
-        await enviarWhatsApp(numero, 'Por enquanto só consigo ler mensagens de texto 🙏 Pode escrever pra mim?');
-        return;
-      }
-      const resposta = await responder(numero, texto);
-      await enviarWhatsApp(numero, resposta);
-    });
+  // Mensagem enviada pelo número do negócio: ou é o próprio bot, ou alguém da equipe respondendo à mão.
+  if (key.fromMe) {
+    if (foiOBot(cliente.instancia, contato, key.id, texto)) return;
+    const horas = cliente.pausa_humano_horas ?? 12;
+    await pausar(cliente.instancia, contato, horas, 'equipe respondeu manualmente');
+    await salvarMensagem(cliente.instancia, contato, 'assistant', `[atendente humano] ${texto || '(enviou mídia)'}`);
+    console.log(`[${cliente.instancia}] humano assumiu ${contato} por ${horas}h`);
+    return;
   }
+
+  // Dono falando com o número do negócio: comandos.
+  if (cliente.dono_whatsapp && mesmoNumero(contato, cliente.dono_whatsapp)) {
+    if (!texto) return;
+    enfileirar(`${cliente.instancia}|dono`, async () => {
+      const resposta = await comandoDoDono(cliente, texto);
+      await enviarTexto(cliente, contato, resposta);
+    });
+    return;
+  }
+
+  if (!cliente.ativo) return;
+
+  if (await estaPausado(cliente.instancia, contato)) {
+    if (texto) await salvarMensagem(cliente.instancia, contato, 'user', texto);
+    return;
+  }
+
+  if (!texto) {
+    await enviarTexto(cliente, contato, 'Por enquanto só consigo ler mensagens de texto 🙏 Pode escrever pra mim?');
+    return;
+  }
+
+  agrupar(cliente, contato, texto, d.pushName);
+}
+
+async function processarEvento(corpo) {
+  const { event, instance, data } = corpo || {};
+  if (!instance) return;
+  if (event && !/messages[._]upsert/i.test(String(event))) return;
+
+  const cliente = await obterCliente(instance);
+  if (!cliente) {
+    console.warn(`Mensagem da instância "${instance}", mas não existe clientes/${instance}.json`);
+    return;
+  }
+  for (const d of Array.isArray(data) ? data : [data]) await tratarMensagem(cliente, d);
+}
+
+// ---------- Servidor ----------
+const app = express();
+app.use(express.json({ limit: '10mb' }));
+
+app.get('/', (_req, res) => res.send('Bot atendente no ar ✅'));
+
+app.post('/webhook', (req, res) => {
+  const segredo = process.env.WEBHOOK_SECRET;
+  if (segredo && req.query.secret !== segredo) return res.sendStatus(401);
+  res.sendStatus(200); // responde rápido; o resto roda em segundo plano
+  processarEvento(req.body).catch((e) => console.error('webhook:', e));
 });
 
-// Protege as rotas de teste/agenda com ?token=ADMIN_TOKEN (se definido)
 function protegido(req, res, next) {
   const t = process.env.ADMIN_TOKEN;
-  if (t && req.query.token !== t) return res.sendStatus(401);
+  if (!t || req.query.token !== t) return res.sendStatus(401);
   next();
 }
 
-// Rota de teste sem WhatsApp: POST /teste {"telefone":"5511999999999","texto":"oi"}
-app.post('/teste', protegido, async (req, res) => {
-  const { telefone = 'teste', texto } = req.body || {};
-  if (!texto) return res.status(400).json({ erro: 'Envie "texto"' });
-  const resposta = await enfileirar(telefone, () => responder(telefone, texto));
-  res.json({ resposta });
+app.get('/admin/clientes', protegido, async (_req, res) => res.json(await listarClientes()));
+
+app.get('/admin/agenda', protegido, async (req, res) => {
+  const { instancia, data } = req.query;
+  if (instancia && data) return res.json(await agenda.doDia(instancia, data));
+  res.json(await agenda.proximos(instancia));
 });
 
-// Ver a agenda da demo
-app.get('/agenda', protegido, (_req, res) => res.json(agenda.itens));
+// Conversa de teste sem WhatsApp: POST /teste?token=... {"instancia":"demo-barbearia","telefone":"5511999999999","texto":"oi"}
+app.post('/teste', protegido, async (req, res) => {
+  const { instancia, telefone = 'teste', texto } = req.body || {};
+  const cliente = instancia && await obterCliente(instancia);
+  if (!cliente) return res.status(404).json({ erro: 'Instância não cadastrada em clientes/' });
+  if (!texto) return res.status(400).json({ erro: 'Envie "texto"' });
+  try {
+    const r = await enfileirar(`${instancia}|${telefone}`, () => responder(cliente, telefone, texto));
+    res.json(r);
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+await migrar();
+const carregados = await sincronizarArquivos(path.resolve('clientes'));
+console.log(`Clientes carregados: ${carregados.join(', ') || 'nenhum'}`);
 
 const porta = process.env.PORT || 3000;
-app.listen(porta, () => console.log(`${negocio.nome} ouvindo na porta ${porta}`));
+app.listen(porta, () => console.log(`Bot ouvindo na porta ${porta}`));
